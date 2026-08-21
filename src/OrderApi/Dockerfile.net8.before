@@ -1,0 +1,40 @@
+# The .NET 8 version of the same file, kept for comparison. DIFF ONLY --
+# this file no longer builds, by design. See the note at the bottom.
+#
+# Nothing in the Dockerfile itself is wrong. The point is that changing only the
+# two version numbers is what breaks the build, because the base distro changes
+# underneath them:
+#   .NET 8  -> Debian 12 "Bookworm"
+#   .NET 10 -> Ubuntu 24.04 "Noble Numbat"
+#
+# Diff this against ./Dockerfile to see what the upgrade actually touches:
+#
+#   git diff --no-index src/OrderApi/Dockerfile.net8.before src/OrderApi/Dockerfile
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
+
+COPY ["OrderApi.csproj", "./"]
+RUN dotnet restore "OrderApi.csproj"
+
+COPY . .
+RUN dotnet publish "OrderApi.csproj" -c Release -o /app/publish
+
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final
+WORKDIR /app
+
+# Debian package names. `libgdiplus` is the classic example: it exists in the
+# Debian archive and has no identically named counterpart on Noble.
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        libgdiplus \
+        libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+USER $APP_UID
+
+COPY --from=build /app/publish .
+
+ENV ASPNETCORE_HTTP_PORTS=8080
+EXPOSE 8080
+
+ENTRYPOINT ["dotnet", "OrderApi.dll"]
