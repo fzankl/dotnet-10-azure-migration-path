@@ -8,8 +8,8 @@
 #
 #   Pass 2  ARM fan-out, in parallel, for the fields Resource Graph cannot see.
 #           Application settings are not exposed in Resource Graph at any tier,
-#           and FUNCTIONS_WORKER_RUNTIME is the setting that decides in-process
-#           versus isolated worker. There is no query that avoids this pass.
+#           and FUNCTIONS_WORKER_RUNTIME plus FUNCTIONS_EXTENSION_VERSION are
+#           what decide in-process vs isolated and host v3 vs v4.
 #
 # Output: a CSV you can sort and attach exceptions to.
 #
@@ -28,6 +28,12 @@
 #
 # Requires: az cli, jq.
 
+# This script needs bash 4+: associative arrays, mapfile, process
+# substitution. Re-exec if launched as `sh script.sh` under dash/ash.
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 OUTPUT="azure-dotnet-estate-$(date +%Y%m%d).csv"
@@ -42,6 +48,13 @@ TARGET_VERSION="10.0"
 # only with the platform itself. Edit here if Microsoft raises them.
 SWA_MAX_APIRUNTIME="9.0"        # Highest dotnet-isolated Static Web Apps managed API supports
 CONSUMPTION_MAX_SUPPORTED="9.0" # Highest isolated worker version on Linux Consumption
+
+# Functions host retirement dates. Not thresholds and not language versions,
+# so they never move with -t. v3 on Linux Consumption is the only one of the
+# three where the app stops running rather than merely losing support.
+V3_LINUX_CONSUMPTION_STOP="2026-09-30"
+HOST_V1_SUPPORT_END="2026-09-14"
+HOST_V2_V3_SUPPORT_END="2022-12-13"
 
 usage() { sed -n '2,29p' "$0"; exit 1; }
 
@@ -58,6 +71,7 @@ done
 
 TARGET_MAJOR="${TARGET_VERSION%%.*}"
 export TARGET_VERSION TARGET_MAJOR SWA_MAX_APIRUNTIME CONSUMPTION_MAX_SUPPORTED
+export V3_LINUX_CONSUMPTION_STOP HOST_V1_SUPPORT_END HOST_V2_V3_SUPPORT_END
 
 command -v az >/dev/null || { echo "az cli not found" >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq not found" >&2; exit 1; }
@@ -137,6 +151,13 @@ resources
 | extend vmOsType = iff(type in~ ('microsoft.compute/virtualmachines', 'microsoft.compute/virtualmachinescalesets'),
     tostring(coalesce(properties.storageProfile.osDisk.osType,
                       properties.virtualMachineProfile.storageProfile.osDisk.osType)), '')
+// Sites: Linux vs Windows decides two things that Consumption alone does not
+// -- whether the v3 stop on 2026-09-30 applies, and whether the .NET ceiling
+// on Consumption applies at all (it is a Linux Consumption ceiling; Windows
+// Consumption is not affected). kind is the only OS signal Resource Graph
+// exposes for sites, as 'functionapp,linux' or 'app,linux'.
+| extend osFamily = iff(type in~ ('microsoft.web/sites', 'microsoft.web/sites/slots'),
+    iff(siteKind contains 'linux', 'linux', 'windows'), '')
 | join kind=leftouter (
     resourcecontainers
     | where type =~ 'microsoft.resources/subscriptions'
@@ -148,7 +169,7 @@ resources
     | project planId = tolower(id), planTier = tostring(sku.tier)
 ) on planId
 | project id, name, resourceGroup, subscriptionId, subscriptionName,
-    workloadType, isSlot, planTier, images, aksVersion, vmOsType, location
+    workloadType, isSlot, planTier, images, aksVersion, vmOsType, osFamily, location
 | order by id asc
 KQL
 
@@ -184,14 +205,15 @@ if [ "$TOTAL" -eq 0 ]; then
   exit 0
 fi
 
-CSV_HEADER="name,resourceGroup,subscription,workloadType,isSlot,runtime,workerRuntime,planTier,flag,action,resourceId"
+CSV_HEADER="name,resourceGroup,subscription,workloadType,isSlot,runtime,workerRuntime,hostVersion,os,planTier,flag,action,resourceId"
 
 if [ "$SKIP_ARM" -eq 1 ]; then
-  echo "Skipping the ARM probe. Worker model will not be determined." >&2
+  echo "Skipping the ARM probe. Worker model and host version will not be determined." >&2
   {
     echo "$CSV_HEADER"
     jq -r '[.name, .resourceGroup, (.subscriptionName // ""), .workloadType,
-            (.isSlot|tostring), (.images // ""), "NOT PROBED", (.planTier // ""),
+            (.isSlot|tostring), (.images // ""), "NOT PROBED", "NOT PROBED",
+            (.osFamily // ""), (.planTier // ""),
             "UNKNOWN", "pass 2 skipped", .id] | @csv' "$WORK/graph.jsonl"
   } > "$OUTPUT"
   echo "Written: $OUTPUT" >&2
@@ -208,7 +230,8 @@ set -uo pipefail
 RESOURCE_JSON="$1"
 ARM="$2"
 API_VERSION="$3"
-# TARGET_VERSION, TARGET_MAJOR, SWA_MAX_APIRUNTIME, CONSUMPTION_MAX_SUPPORTED
+# TARGET_VERSION, TARGET_MAJOR, SWA_MAX_APIRUNTIME, CONSUMPTION_MAX_SUPPORTED,
+# V3_LINUX_CONSUMPTION_STOP, HOST_V1_SUPPORT_END and HOST_V2_V3_SUPPORT_END
 # come in via the environment, exported by the parent script.
 
 # Fail loudly rather than emitting a row of empty fields. If this fires, the
@@ -223,6 +246,21 @@ fi
 ver_gt() {
   [ "$1" = "$2" ] && return 1
   [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
+
+# Major version out of FUNCTIONS_EXTENSION_VERSION. The setting is written
+# several ways and all of them have to read the same: '~4' and '4' for a
+# floating major, '4.1.3' or '3.0.15584' for an app pinned to a minor. A
+# plain string compare against '~4' calls every pinned v4 app a v3 app.
+# Anything non-numeric -- 'beta', 'latest', an empty setting -- returns empty
+# and is reported as unknown rather than guessed at.
+host_major() {
+  local v="${1#\~}"
+  v="${v%%.*}"
+  case "$v" in
+    ''|*[!0-9]*) echo "" ;;
+    *)           echo "$v" ;;
+  esac
 }
 
 # One field per resource type down here needs its own ARM call (config/web,
@@ -240,14 +278,22 @@ append_action() { action="${action:+$action; }$1"; }
 
 # One jq call for every field pulled off $RESOURCE_JSON, instead of one
 # subprocess per field -- this runs once per resource, thousands of times.
-IFS=$'\t' read -r id name rg sub wtype isslot tier images aksv osType <<<"$(
+#
+# Unit separator, not tab. Tab is IFS whitespace, so bash collapses runs of
+# it into a single delimiter and every empty field silently shifts the rest
+# one position left. A Container App has no planTier, so with @tsv its image
+# tag lands in the tier variable and images comes back empty; a Function App
+# has no images, aksVersion or vmOsType, so osFamily lands in images. \x1f is
+# not IFS whitespace, so empty fields stay empty and in place.
+IFS=$'\037' read -r id name rg sub wtype isslot tier images aksv osType osFam <<<"$(
   echo "$RESOURCE_JSON" | jq -r '[.id, .name, .resourceGroup, (.subscriptionName // ""),
     .workloadType, (.isSlot|tostring), (.planTier // ""), (.images // ""),
-    (.aksVersion // ""), (.vmOsType // "")] | @tsv'
+    (.aksVersion // ""), (.vmOsType // ""), (.osFamily // "")] | join("\u001f")'
 )"
 
 runtime=""
 worker=""
+hostVer=""
 action=""
 flag="REVIEW"
 
@@ -336,6 +382,10 @@ case "$wtype" in
       if [ -n "$flexName" ]; then
         runtime="${flexName}|${flexVer}"
         worker="$flexName"
+        # Flex Consumption only ever ran on host v4, and it does not carry
+        # FUNCTIONS_EXTENSION_VERSION. Set here so these apps do not fall
+        # through the host-version check below as unknown.
+        hostVer="~4"
         append_action "Flex Consumption - runtime in functionAppConfig"
       else
         # Listing app settings is a POST in ARM, not a GET. Reader is not
@@ -343,7 +393,11 @@ case "$wtype" in
         settings=$(az rest --method POST \
           --url "${ARM}${id}/config/appsettings/list?api-version=${API_VERSION}" \
           --only-show-errors 2>/dev/null || echo '{}')
+        # Both settings come out of the same response, so the host version
+        # costs no extra call and no extra permission over what pass 2
+        # already needs.
         worker=$(echo "$settings" | jq -r '.properties.FUNCTIONS_WORKER_RUNTIME // ""')
+        hostVer=$(echo "$settings" | jq -r '.properties.FUNCTIONS_EXTENSION_VERSION // ""')
         if [ -z "$worker" ]; then
           worker="UNREADABLE"
           append_action "no permission to list app settings"
@@ -383,8 +437,37 @@ case "$wtype" in
           append_action "isolated, framework below ${TARGET_VERSION}"
         fi ;;
     esac
-    if [ "$tier" = "Dynamic" ] && ver_gt "$TARGET_VERSION" "$CONSUMPTION_MAX_SUPPORTED"; then
-      append_action "Consumption plan - .NET ${TARGET_VERSION} unsupported on Linux Consumption (max: ${CONSUMPTION_MAX_SUPPORTED})"
+    # The host runtime version is a separate axis from the worker model and
+    # from the -t threshold. v2 and v3 lost support on 2022-12-13 and v1
+    # loses it on 2026-09-14, but only one combination stops executing:
+    # v3 + Linux + Consumption, after 2026-09-30. Checked for every worker
+    # runtime, not just dotnet -- a Node or Python app on v3 hits the same
+    # date and would otherwise sit in the default REVIEW bucket.
+    hostMajor="$(host_major "$hostVer")"
+    if [ -n "$hostMajor" ] && [ "$hostMajor" -lt 4 ]; then
+      flag="CRITICAL"
+      if [ "$hostMajor" -eq 3 ] && [ "$osFam" = "linux" ] && [ "$tier" = "Dynamic" ]; then
+        append_action "host v3 on Linux Consumption - STOPS RUNNING after ${V3_LINUX_CONSUMPTION_STOP}; migrate to ~4"
+      elif [ "$hostMajor" -eq 1 ]; then
+        append_action "host v1 (${hostVer}), support ends ${HOST_V1_SUPPORT_END}; migrate to ~4"
+      else
+        append_action "host v${hostMajor} (${hostVer}), out of support since ${HOST_V2_V3_SUPPORT_END}; migrate to ~4"
+      fi
+    elif [ -z "$hostMajor" ] && [ "$worker" != "UNREADABLE" ]; then
+      flag="UNKNOWN"
+      if [ -z "$hostVer" ]; then
+        append_action "FUNCTIONS_EXTENSION_VERSION not set - host version undetermined"
+      else
+        append_action "FUNCTIONS_EXTENSION_VERSION is '${hostVer}', no numeric major - check manually"
+      fi
+    fi
+
+    # The ceiling is a Linux Consumption ceiling. Windows Consumption sits on
+    # the same Dynamic tier and is not affected, so the OS has to be part of
+    # the condition or every Windows Consumption app gets told to move plans.
+    if [ "$tier" = "Dynamic" ] && [ "$osFam" = "linux" ] \
+       && ver_gt "$TARGET_VERSION" "$CONSUMPTION_MAX_SUPPORTED"; then
+      append_action "Linux Consumption - .NET ${TARGET_VERSION} unsupported here (max: ${CONSUMPTION_MAX_SUPPORTED})"
       flag="CRITICAL"
       append_action "plan move required"
     fi
@@ -420,9 +503,10 @@ esac
 jq -cn --arg a "$name" --arg b "$rg" --arg c "$sub" --arg d "$wtype" \
        --arg e "$isslot" --arg f "$runtime" --arg g "$worker" --arg h "$tier" \
        --arg i "$flag" --arg j "$action" --arg k "$id" \
+       --arg l "$hostVer" --arg m "$osFam" \
   '{name:$a, resourceGroup:$b, subscription:$c, workloadType:$d, isSlot:$e,
-    runtime:$f, workerRuntime:$g, planTier:$h, flag:$i, action:$j,
-    resourceId:$k}'
+    runtime:$f, workerRuntime:$g, hostVersion:$l, os:$m, planTier:$h,
+    flag:$i, action:$j, resourceId:$k}'
 PROBEEOF
 chmod +x "$WORK/probe.sh"
 
@@ -449,8 +533,8 @@ jq -s 'sort_by(.flag, .subscription, .name)' "$WORK"/rows/*.json > "$WORK/all.js
 {
   echo "$CSV_HEADER"
   jq -r '.[] | [.name, .resourceGroup, .subscription, .workloadType, .isSlot,
-                .runtime, .workerRuntime, .planTier, .flag, .action,
-                .resourceId] | @csv' "$WORK/all.json"
+                .runtime, .workerRuntime, .hostVersion, .os, .planTier,
+                .flag, .action, .resourceId] | @csv' "$WORK/all.json"
 } > "$OUTPUT"
 
 echo "" >&2
