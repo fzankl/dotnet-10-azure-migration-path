@@ -60,6 +60,28 @@ V3_LINUX_CONSUMPTION_STOP="2026-09-30"
 HOST_V1_SUPPORT_END="2026-09-14"
 HOST_V2_V3_SUPPORT_END="2022-12-13"
 
+# .NET end-of-support dates, from the official support policy. Two different
+# questions get answered from this table: whether a version found in the estate
+# still gets security fixes, and whether the version -t names is one worth
+# migrating to. Neither is the same question as "below the target" -- an app
+# can be on the target and still be months from the end of its support.
+#
+# Flat string rather than an associative array because probe.sh runs as a
+# separate process and only strings survive the environment. A version that is
+# not listed gets no claim made about it: .NET 11 has no announced date yet,
+# and .NET Framework follows the Windows lifecycle, not this one.
+DOTNET_EOL="2.1:2021-08-21 2.2:2019-12-23 3.0:2020-03-03 3.1:2022-12-13 5.0:2022-05-10 6.0:2024-11-12 7.0:2024-05-14 8.0:2026-11-10 9.0:2026-11-10 10.0:2028-11-14"
+
+# Once, here, rather than a date call per resource in the fan-out. ISO dates
+# compare correctly as plain strings, which is the whole reason for the format.
+TODAY="$(date +%F)"
+
+# Multi-container App Service (Docker Compose, linuxFxVersion COMPOSE|...) is
+# retired on this date and replaced by sidecar containers. A hosting-model
+# deadline like the Functions host ones above: it applies whatever is inside
+# the images, so it does not move with -t either.
+COMPOSE_RETIREMENT="2027-03-31"
+
 usage() { sed -n '2,29p' "$0"; exit 1; }
 
 while getopts ":o:p:s:t:nh" opt; do
@@ -75,7 +97,24 @@ done
 
 TARGET_MAJOR="${TARGET_VERSION%%.*}"
 export TARGET_VERSION TARGET_MAJOR SWA_MAX_APIRUNTIME CONSUMPTION_MAX_SUPPORTED
-export V3_LINUX_CONSUMPTION_STOP HOST_V1_SUPPORT_END HOST_V2_V3_SUPPORT_END
+export V3_LINUX_CONSUMPTION_STOP HOST_V1_SUPPORT_END HOST_V2_V3_SUPPORT_END COMPOSE_RETIREMENT
+export DOTNET_EOL TODAY
+
+# The target is worth a sanity check of its own before anything is inventoried.
+# Migrating an estate onto a version that is already out of support, or that
+# runs out during the project, is a decision to make knowingly.
+TARGET_EOL=""
+for pair in $DOTNET_EOL; do
+  [ "${pair%%:*}" = "$TARGET_VERSION" ] && TARGET_EOL="${pair#*:}"
+done
+if [ -z "$TARGET_EOL" ]; then
+  echo "Target .NET ${TARGET_VERSION}, no end-of-support date on file" >&2
+elif [ "$TARGET_EOL" \< "$TODAY" ]; then
+  echo "WARNING: target .NET ${TARGET_VERSION} went out of support on ${TARGET_EOL}." >&2
+  echo "         Everything this run reports as OK is already unsupported." >&2
+else
+  echo "Target .NET ${TARGET_VERSION}, supported until ${TARGET_EOL}" >&2
+fi
 
 command -v az >/dev/null || { echo "az cli not found" >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq not found" >&2; exit 1; }
@@ -248,8 +287,8 @@ RESOURCE_JSON="$1"
 ARM="$2"
 API_VERSION="$3"
 # TARGET_VERSION, TARGET_MAJOR, SWA_MAX_APIRUNTIME, CONSUMPTION_MAX_SUPPORTED,
-# V3_LINUX_CONSUMPTION_STOP, HOST_V1_SUPPORT_END and HOST_V2_V3_SUPPORT_END
-# come in via the environment, exported by the parent script.
+# V3_LINUX_CONSUMPTION_STOP, HOST_V1_SUPPORT_END, HOST_V2_V3_SUPPORT_END and
+# COMPOSE_RETIREMENT come in via the environment, exported by the parent script.
 
 # Fail loudly rather than emitting a row of empty fields. If this fires, the
 # JSON was mangled before it got here -- check how the caller passes it.
@@ -293,16 +332,73 @@ arm_get() {
 # same regardless of whether action already has content.
 append_action() { action="${action:+$action; }$1"; }
 
+# Fx values are compared uppercased throughout. The portal writes DOCKER| and
+# COMPOSE| in caps, but the documented way to move an app to sidecars is
+# `az webapp config set --linux-fx-version "sitecontainers"`, which stores
+# exactly what it is given -- so case is a property of who configured the site,
+# not of what it runs.
+fx_upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+
 # A container-hosted site carries an image reference in linuxFxVersion or
 # windowsFxVersion where a code site carries a runtime stack: DOCKER|<image>,
-# the deprecated multi-container COMPOSE|<base64 compose file>, and
-# SITECONTAINERS for the newer multi-container model. The framework then lives
-# inside the image, which ARM cannot see, so none of the stack comparisons
-# apply -- without this every containerised site reads as "stack below target".
+# the retiring multi-container COMPOSE|<base64 compose file>, and
+# SITECONTAINERS for the sidecar model that replaces it. The framework then
+# lives inside the image, which ARM cannot see, so none of the stack
+# comparisons apply -- without this every containerised site reads as
+# "stack below target".
 is_container_fx() {
-  case "$1" in
+  case "$(fx_upper "$1")" in
     DOCKER\|*|COMPOSE\|*|SITECONTAINERS*) return 0 ;;
     *)                                    return 1 ;;
+  esac
+}
+
+# The .NET version out of whatever the platform reports it as, or empty where
+# the value is not a .NET version at all. Matching the stack prefix rather than
+# just taking the part after the pipe matters: a NODE|10.0 site would otherwise
+# be looked up in the .NET table and reported as supported until 2028.
+dotnet_version_of() {
+  local u; u="$(fx_upper "$1")"
+  case "$u" in
+    DOTNETCORE\|*|DOTNET-ISOLATED\|*|DOTNET\|*) echo "${u##*|}" ;;
+    # Windows reports a bare version in netFrameworkVersion. v1 to v4 is .NET
+    # Framework, supported for as long as the Windows it ships with, so this
+    # table has nothing to say about it.
+    V1.*|V2.*|V3.*|V4.*)                        echo "" ;;
+    V[0-9]*)                                    echo "${u#V}" ;;
+    *)                                          echo "" ;;
+  esac
+}
+
+# End-of-support date for a .NET version, empty for a version the table does
+# not carry. Empty means no claim, never "supported".
+dotnet_eol() {
+  local pair
+  for pair in $DOTNET_EOL; do
+    if [ "${pair%%:*}" = "$1" ]; then echo "${pair#*:}"; return; fi
+  done
+  echo ""
+}
+
+# Multi-container App Service, the one hosting model here with an end date of
+# its own. Separate from is_container_fx because the deadline is a fact about
+# the site that ARM does report, where the framework in the image is not.
+is_compose_fx() {
+  case "$(fx_upper "$1")" in
+    COMPOSE\|*) return 0 ;;
+    *)          return 1 ;;
+  esac
+}
+
+# The Fx value is what selects the runtime image on Linux, so a non-.NET stack
+# here is conclusive: the site is not a .NET app on an old framework, it is not
+# a .NET app at all. Without this every Node, PHP, Java or Python site in the
+# estate -- an SPA served by the Node stack included -- comes back as
+# "stack below <target>", an answer to a question nobody asked.
+is_non_dotnet_fx() {
+  case "$(fx_upper "$1")" in
+    NODE\|*|PHP\|*|PYTHON\|*|JAVA\|*|TOMCAT\|*|JBOSSEAP\|*|RUBY\|*|GO\|*) return 0 ;;
+    *)                                                                    return 1 ;;
   esac
 }
 
@@ -404,14 +500,45 @@ case "$wtype" in
   *)
     # FunctionApp and AppService both need siteConfig, read the same way.
     cfg=$(arm_get "${id}/config/web")
-    linuxFx=$(echo "$cfg" | jq -r '.properties.linuxFxVersion // ""')
+
+    # Every siteConfig field this script needs, in one jq call and one read.
+    # Same \x1f join as the Resource Graph row above, for the same reason:
+    # empty fields have to stay empty and in place.
+    #
+    #   nodeVersion, phpVersion, pythonVersion, javaVersion  Windows only. The
+    #     Windows worker carries every stack side by side, so a Node or PHP
+    #     site there still reports a netFrameworkVersion -- the sibling field
+    #     is the only thing that says which stack the site actually runs.
+    #   cfgRead  separates "the site reports no stack" from "the call did not
+    #     come back": arm_get returns '{}' on failure, and a hole in the
+    #     inventory must not be reported as a fact about the site.
+    IFS=$'\037' read -r linuxFx winFx netFx nodeV phpV pyV javaV cfgRead <<<"$(
+      echo "$cfg" | jq -r '[(.properties.linuxFxVersion // ""),
+        (.properties.windowsFxVersion // ""), (.properties.netFrameworkVersion // ""),
+        (.properties.nodeVersion // ""), (.properties.phpVersion // ""),
+        (.properties.pythonVersion // ""), (.properties.javaVersion // ""),
+        (if .properties then "1" else "" end)] | join("\u001f")'
+    )"
+
     # A Windows container puts its image in windowsFxVersion and leaves
     # netFrameworkVersion populated with whatever stack the worker exposes, so
     # the Fx value has to win or a Windows container reads as a code app on a
     # framework it is not actually running.
-    winFx=$(echo "$cfg"   | jq -r '.properties.windowsFxVersion // ""')
-    netFx=$(echo "$cfg"   | jq -r '.properties.netFrameworkVersion // ""')
     runtime="${linuxFx:-${winFx:-$netFx}}"
+
+    # Windows sites only. On Linux the Fx value is what selects the runtime,
+    # and a stale nodeVersion sitting on a Linux site would mislabel a .NET app
+    # as Node. 'OFF' is what the portal writes into phpVersion once another
+    # stack is picked, so it means the opposite of the field being set.
+    winStack=""
+    if [ -z "$linuxFx" ]; then
+      for kv in "node:$nodeV" "php:$phpV" "python:$pyV" "java:$javaV"; do
+        case "${kv#*:}" in
+          ''|OFF|off) continue ;;
+        esac
+        winStack="${winStack:+$winStack, }${kv%%:*} ${kv#*:}"
+      done
+    fi
 
     if [ "$wtype" = "FunctionApp" ]; then
       # Flex Consumption keeps the runtime on the site resource, in
@@ -461,13 +588,25 @@ case "$wtype" in
   FunctionApp)
     # In-process hosting retires on its own fixed date regardless of which
     # version this run targets, so that branch stays unconditional.
-    case "$worker" in
+    # FUNCTIONS_WORKER_RUNTIME is free text in app settings. The portal writes
+    # it lowercase, an ARM template or a hand edit can put 'DOTNET' or 'Node'
+    # there, and an in-process app that reads as unrecognized is the one miss
+    # that matters. Compared lowercased, reported in the CSV as written.
+    workerLc=$(printf '%s' "$worker" | tr '[:upper:]' '[:lower:]')
+    case "$workerLc" in
       dotnet)
         flag="CRITICAL"
         append_action "in-process, retires 2026-11-10" ;;
-      UNREADABLE)
+      unreadable)
         flag="UNKNOWN"
         append_action "cannot read settings" ;;
+      node|python|java|powershell|custom)
+        # The worker runtime settles it: none of these host .NET code, so there
+        # is no framework version to compare and nothing to migrate for .NET.
+        # The host-version check below still runs, because that is a platform
+        # deadline and applies whatever language the app is written in.
+        flag="NOTDOTNET"
+        append_action "${worker} worker, not a .NET app" ;;
       # dotnet-isolated and any other/unrecognized worker both pass on a
       # runtime match; they differ only in what an outright mismatch means
       # -- dotnet-isolated is a known worker so a mismatch is actionable,
@@ -482,7 +621,7 @@ case "$wtype" in
         elif echo "$runtime" | grep -qF "$TARGET_VERSION"; then
           flag="OK"
           append_action "isolated .NET ${TARGET_VERSION}"
-        elif [ "$worker" = "dotnet-isolated" ]; then
+        elif [ "$workerLc" = "dotnet-isolated" ]; then
           flag="ACTION"
           append_action "isolated, framework below ${TARGET_VERSION}"
         fi ;;
@@ -533,8 +672,18 @@ case "$wtype" in
     # is reported as being on an old framework the script never actually read.
     if is_container_fx "$runtime"; then
       flag="MANUAL"
+      # The hosting model outranks the unreadable framework version here: this
+      # date applies to the site whatever the images turn out to contain, and
+      # it is the only thing about a container site ARM can state as fact.
+      if is_compose_fx "$runtime"; then
+        flag="CRITICAL"
+        append_action "multi-container (Docker Compose) retires ${COMPOSE_RETIREMENT} - migrate to sidecar containers (linuxFxVersion sitecontainers), which is a separate move from any .NET upgrade"
+      fi
       append_action "custom container - .NET version is inside the image, not visible in ARM; rebuild the image on a .NET ${TARGET_VERSION} base"
       append_image_tag_hint "$runtime"
+    elif is_non_dotnet_fx "$runtime"; then
+      flag="NOTDOTNET"
+      append_action "${runtime%%|*} stack, not a .NET app"
     # On Windows the stack setting is not proof the app moved. Every supported
     # runtime is installed side by side on the worker, so an older app keeps
     # binding to its actual version while netFrameworkVersion reports the
@@ -546,15 +695,55 @@ case "$wtype" in
     elif echo "$runtime" | grep -qE "^v${TARGET_MAJOR}"; then
       flag="VERIFY"
       append_action "Windows stack says ${TARGET_MAJOR}, confirm loaded runtime; Windows: check RuntimeInformation.FrameworkDescription, not the stack setting"
-    elif [ -n "$runtime" ]; then
-      flag="ACTION"
-      append_action "stack below ${TARGET_VERSION}"
+    # Only consulted once the value is not a current .NET one. A Windows site
+    # running another stack still reports a netFrameworkVersion, so the sibling
+    # field is the evidence and netFrameworkVersion is just the default.
+    elif [ -n "$winStack" ]; then
+      flag="NOTDOTNET"
+      append_action "Windows site running ${winStack}; netFrameworkVersion (${runtime:-unset}) is the platform default here, not evidence of .NET"
     else
-      flag="UNKNOWN"
-      append_action "no runtime reported"
+      case "$runtime" in
+        # .NET Framework rather than an older .NET, worth saying because the
+        # move to the target is a port and not a version bump. v4.0 is equally
+        # what a Windows site running no .NET at all reports, though, static
+        # content and SPAs included, so it cannot be stated as fact.
+        v1.*|v2.*|v3.*|v4.*)
+          flag="ACTION"
+          append_action ".NET Framework ${runtime} - a port to .NET ${TARGET_VERSION}, not an upgrade; on Windows this value is also the default for a site that runs no .NET, so confirm there is a .NET app here first" ;;
+        ?*)
+          flag="ACTION"
+          append_action "stack below ${TARGET_VERSION}" ;;
+        # No stack at all. Where the config was read, that is an answer and not
+        # a gap: nothing is configured to run, which is what an SPA or other
+        # static content deployed to App Service looks like from ARM.
+        *)
+          if [ -z "$cfgRead" ]; then
+            flag="UNKNOWN"
+            append_action "site config could not be read - check permissions on Microsoft.Web/sites/config"
+          else
+            flag="NOTDOTNET"
+            append_action "no runtime stack configured - static content such as an SPA, or nothing deployed; no .NET stack to migrate"
+          fi ;;
+      esac
     fi
     ;;
 esac
+
+# Support status of the .NET version actually found, for every workload type
+# that reported one. Deliberately outside the classification above, because
+# this is a different axis from the -t comparison: "below the target" is a
+# decision someone made, "no longer receiving security fixes" is a date that
+# passed. An app can be on the target version and still be either.
+eolVer="$(dotnet_version_of "$runtime")"
+if [ -n "$eolVer" ]; then
+  eolDate="$(dotnet_eol "$eolVer")"
+  if [ -n "$eolDate" ] && [ "$eolDate" \< "$TODAY" ]; then
+    flag="CRITICAL"
+    append_action ".NET ${eolVer} out of support since ${eolDate} - no security fixes"
+  elif [ -n "$eolDate" ]; then
+    append_action ".NET ${eolVer} supported until ${eolDate}"
+  fi
+fi
 
 # One JSON object per resource, not a CSV row. Keeping this structured lets
 # the caller both build the CSV and group the summary by flag without
@@ -609,7 +798,7 @@ echo "" >&2
 echo "Summary:" >&2
 
 # PRIORITY only fixes display order, most urgent first
-PRIORITY=(CRITICAL UNKNOWN ACTION VERIFY REVIEW MANUAL OK)
+PRIORITY=(CRITICAL UNKNOWN ACTION VERIFY REVIEW MANUAL OK NOTDOTNET)
 mapfile -t PRESENT_FLAGS < <(jq -r '[.[].flag] | unique | .[]' "$WORK/all.json")
 
 # Only colorize when stderr is an actual terminal, so redirecting the summary
