@@ -520,12 +520,16 @@ case "$wtype" in
     # framework it is not actually running.
     runtime="${linuxFx:-${winFx:-$netFx}}"
 
-    # Which stack a Windows site actually runs. The per-language version fields
-    # in siteConfig cannot answer this: the Windows worker carries every stack
-    # side by side and leaves defaults behind in phpVersion and friends, so a
-    # .NET app routinely reports a phpVersion it has never run. CURRENT_STACK
-    # is the field the portal's stack picker reads and writes, and it is the
-    # only one that means what it says.
+    # Whether a Windows site runs .NET at all. The per-language version fields
+    # in siteConfig cannot answer even that: the Windows worker carries every
+    # stack side by side and leaves defaults behind in phpVersion and friends,
+    # so a .NET app routinely reports a phpVersion it has never run.
+    # CURRENT_STACK is what the portal's stack picker reads and writes, and php
+    # or node there is conclusive.
+    #
+    # It does not go further than that. The value is undocumented and has
+    # carried both 'dotnet' and 'dotnetcore' for ASP.NET Core over time, so it
+    # separates .NET from not-.NET and never .NET Framework from .NET.
     #
     # It lives in site metadata, which is a POST like app settings and not part
     # of config/web, so this costs one extra call -- Windows App Service only,
@@ -708,13 +712,18 @@ case "$wtype" in
         # certain depends on CURRENT_STACK: 'dotnet' is the portal saying so,
         # and without it v4.0 is equally what a Windows site running no .NET at
         # all reports, static content and SPAs included.
+        # Not ".NET Framework", however much it looks like it. On Windows this
+        # is the app-pool CLR, which an ASP.NET Core app reports just as
+        # readily as a Framework one -- the docs are explicit that a Core app's
+        # version on Windows comes from the project's target framework, with
+        # every supported runtime installed side by side on the worker and
+        # nothing about it in site config. CURRENT_STACK does not settle it
+        # either: it is undocumented and has carried 'dotnet' for both over the
+        # years. So the honest answer is which app this is cannot be read from
+        # ARM, and the row says where it can be read instead.
         v1.*|v2.*|v3.*|v4.*)
-          flag="ACTION"
-          if [ "$currentStack" = "dotnet" ]; then
-            append_action ".NET Framework ${runtime} (CURRENT_STACK dotnet) - a port to .NET ${TARGET_VERSION}, not an upgrade"
-          else
-            append_action ".NET Framework ${runtime} - a port to .NET ${TARGET_VERSION}, not an upgrade; no CURRENT_STACK set here and this value is also the default for a Windows site that runs no .NET, so confirm there is a .NET app first"
-          fi ;;
+          flag="VERIFY"
+          append_action "netFrameworkVersion ${runtime}${currentStack:+, CURRENT_STACK ${currentStack}} - on Windows that is the app-pool CLR and says nothing about the app: .NET Framework and ASP.NET Core both report it, and a Core app's version lives in its project, not in ARM. Determine it from the app (runtimeconfig.json, RuntimeInformation.FrameworkDescription, or Kudu) before planning an upgrade or a port" ;;
         ?*)
           flag="ACTION"
           append_action "stack below ${TARGET_VERSION}" ;;
