@@ -293,6 +293,31 @@ arm_get() {
 # same regardless of whether action already has content.
 append_action() { action="${action:+$action; }$1"; }
 
+# A container-hosted site carries an image reference in linuxFxVersion or
+# windowsFxVersion where a code site carries a runtime stack: DOCKER|<image>,
+# the deprecated multi-container COMPOSE|<base64 compose file>, and
+# SITECONTAINERS for the newer multi-container model. The framework then lives
+# inside the image, which ARM cannot see, so none of the stack comparisons
+# apply -- without this every containerised site reads as "stack below target".
+is_container_fx() {
+  case "$1" in
+    DOCKER\|*|COMPOSE\|*|SITECONTAINERS*) return 0 ;;
+    *)                                    return 1 ;;
+  esac
+}
+
+# The only signal an image reference carries is its tag, and a tag is a
+# convention rather than a contract, so this can suggest and never conclude.
+# Shared by Container Apps/Jobs/Instances and by container-hosted sites.
+append_image_tag_hint() {
+  case "$1" in
+    *:${TARGET_MAJOR}.0*|*net${TARGET_MAJOR}*)
+      append_action "image tag suggests .NET ${TARGET_VERSION} - verify" ;;
+    *)
+      append_action "check image tag manually" ;;
+  esac
+}
+
 # One jq call for every field pulled off $RESOURCE_JSON, instead of one
 # subprocess per field -- this runs once per resource, thousands of times.
 #
@@ -323,10 +348,7 @@ case "$wtype" in
     runtime="$images"
     worker="n/a"
     append_action "rebuild image on Ubuntu base"
-    case "$images" in
-      *:${TARGET_MAJOR}.0*|*net${TARGET_MAJOR}*) append_action "image tag suggests .NET ${TARGET_VERSION} - verify" ;;
-      *)                                         append_action "check image tag manually" ;;
-    esac
+    append_image_tag_hint "$images"
     ;;
 
   AksCluster)
@@ -383,8 +405,13 @@ case "$wtype" in
     # FunctionApp and AppService both need siteConfig, read the same way.
     cfg=$(arm_get "${id}/config/web")
     linuxFx=$(echo "$cfg" | jq -r '.properties.linuxFxVersion // ""')
+    # A Windows container puts its image in windowsFxVersion and leaves
+    # netFrameworkVersion populated with whatever stack the worker exposes, so
+    # the Fx value has to win or a Windows container reads as a code app on a
+    # framework it is not actually running.
+    winFx=$(echo "$cfg"   | jq -r '.properties.windowsFxVersion // ""')
     netFx=$(echo "$cfg"   | jq -r '.properties.netFrameworkVersion // ""')
-    runtime="${linuxFx:-$netFx}"
+    runtime="${linuxFx:-${winFx:-$netFx}}"
 
     if [ "$wtype" = "FunctionApp" ]; then
       # Flex Consumption keeps the runtime on the site resource, in
@@ -446,7 +473,13 @@ case "$wtype" in
       # -- dotnet-isolated is a known worker so a mismatch is actionable,
       # anything else is unrecognized so it stays at the default REVIEW.
       *)
-        if echo "$runtime" | grep -qiF "$TARGET_VERSION"; then
+        if is_container_fx "$runtime"; then
+          # The worker model is readable from app settings, the framework
+          # version is not: it is inside the image, same as for App Service.
+          flag="MANUAL"
+          append_action "custom container - .NET version is inside the image, not visible in ARM"
+          append_image_tag_hint "$runtime"
+        elif echo "$runtime" | grep -qF "$TARGET_VERSION"; then
           flag="OK"
           append_action "isolated .NET ${TARGET_VERSION}"
         elif [ "$worker" = "dotnet-isolated" ]; then
@@ -493,12 +526,21 @@ case "$wtype" in
     : # flag already set above
     ;;
   AppService)
+    # A container-hosted site has no runtime stack to compare against: the
+    # framework is baked into the image and ARM only ever sees the image
+    # reference. Checked before the stack comparisons, or DOCKER|... falls
+    # through to the "stack below target" branch and every containerised app
+    # is reported as being on an old framework the script never actually read.
+    if is_container_fx "$runtime"; then
+      flag="MANUAL"
+      append_action "custom container - .NET version is inside the image, not visible in ARM; rebuild the image on a .NET ${TARGET_VERSION} base"
+      append_image_tag_hint "$runtime"
     # On Windows the stack setting is not proof the app moved. Every supported
     # runtime is installed side by side on the worker, so an older app keeps
     # binding to its actual version while netFrameworkVersion reports the
     # latest installed. Only the Linux value, which selects the container
     # image, actually constrains what runs.
-    if echo "$runtime" | grep -qF "DOTNETCORE|${TARGET_VERSION}"; then
+    elif echo "$runtime" | grep -qF "DOTNETCORE|${TARGET_VERSION}"; then
       flag="OK"
       append_action ".NET ${TARGET_VERSION} stack"
     elif echo "$runtime" | grep -qE "^v${TARGET_MAJOR}"; then
