@@ -22,8 +22,8 @@
 #
 # Permissions:
 #   Pass 1  Reader on the subscriptions in scope.
-#   Pass 2  additionally Microsoft.Web/sites/config/list/action, because
-#           listing application settings is a POST in ARM, not a read.
+#   Pass 2  additionally Microsoft.Web/sites/config/list/action: listing app
+#           settings and Windows stack metadata is a POST in ARM, not a read.
 #           Included in Contributor and in Website Contributor.
 #
 # Requires: az cli, jq.
@@ -505,18 +505,12 @@ case "$wtype" in
     # Same \x1f join as the Resource Graph row above, for the same reason:
     # empty fields have to stay empty and in place.
     #
-    #   nodeVersion, phpVersion, pythonVersion, javaVersion  Windows only. The
-    #     Windows worker carries every stack side by side, so a Node or PHP
-    #     site there still reports a netFrameworkVersion -- the sibling field
-    #     is the only thing that says which stack the site actually runs.
     #   cfgRead  separates "the site reports no stack" from "the call did not
     #     come back": arm_get returns '{}' on failure, and a hole in the
     #     inventory must not be reported as a fact about the site.
-    IFS=$'\037' read -r linuxFx winFx netFx nodeV phpV pyV javaV cfgRead <<<"$(
+    IFS=$'\037' read -r linuxFx winFx netFx cfgRead <<<"$(
       echo "$cfg" | jq -r '[(.properties.linuxFxVersion // ""),
         (.properties.windowsFxVersion // ""), (.properties.netFrameworkVersion // ""),
-        (.properties.nodeVersion // ""), (.properties.phpVersion // ""),
-        (.properties.pythonVersion // ""), (.properties.javaVersion // ""),
         (if .properties then "1" else "" end)] | join("\u001f")'
     )"
 
@@ -526,18 +520,23 @@ case "$wtype" in
     # framework it is not actually running.
     runtime="${linuxFx:-${winFx:-$netFx}}"
 
-    # Windows sites only. On Linux the Fx value is what selects the runtime,
-    # and a stale nodeVersion sitting on a Linux site would mislabel a .NET app
-    # as Node. 'OFF' is what the portal writes into phpVersion once another
-    # stack is picked, so it means the opposite of the field being set.
-    winStack=""
-    if [ -z "$linuxFx" ]; then
-      for kv in "node:$nodeV" "php:$phpV" "python:$pyV" "java:$javaV"; do
-        case "${kv#*:}" in
-          ''|OFF|off) continue ;;
-        esac
-        winStack="${winStack:+$winStack, }${kv%%:*} ${kv#*:}"
-      done
+    # Which stack a Windows site actually runs. The per-language version fields
+    # in siteConfig cannot answer this: the Windows worker carries every stack
+    # side by side and leaves defaults behind in phpVersion and friends, so a
+    # .NET app routinely reports a phpVersion it has never run. CURRENT_STACK
+    # is the field the portal's stack picker reads and writes, and it is the
+    # only one that means what it says.
+    #
+    # It lives in site metadata, which is a POST like app settings and not part
+    # of config/web, so this costs one extra call -- Windows App Service only,
+    # where nothing cheaper exists. Absent on sites deployed without the portal
+    # or a metadata block in their template, and empty then means no claim.
+    currentStack=""
+    if [ "$wtype" = "AppService" ] && [ -z "$linuxFx" ]; then
+      currentStack=$(az rest --method POST \
+        --url "${ARM}${id}/config/metadata/list?api-version=${API_VERSION}" \
+        --only-show-errors 2>/dev/null \
+        | jq -r '.properties.CURRENT_STACK // ""' | tr '[:upper:]' '[:lower:]')
     fi
 
     if [ "$wtype" = "FunctionApp" ]; then
@@ -684,6 +683,13 @@ case "$wtype" in
     elif is_non_dotnet_fx "$runtime"; then
       flag="NOTDOTNET"
       append_action "${runtime%%|*} stack, not a .NET app"
+    # The Windows equivalent, and the only Windows signal worth acting on. A
+    # site whose stack picker says php is a PHP site whatever netFrameworkVersion
+    # happens to report next to it.
+    elif [ "$currentStack" = "php" ] || [ "$currentStack" = "node" ] \
+      || [ "$currentStack" = "python" ] || [ "$currentStack" = "java" ]; then
+      flag="NOTDOTNET"
+      append_action "Windows stack is ${currentStack} (CURRENT_STACK), not a .NET app"
     # On Windows the stack setting is not proof the app moved. Every supported
     # runtime is installed side by side on the worker, so an older app keeps
     # binding to its actual version while netFrameworkVersion reports the
@@ -695,21 +701,20 @@ case "$wtype" in
     elif echo "$runtime" | grep -qE "^v${TARGET_MAJOR}"; then
       flag="VERIFY"
       append_action "Windows stack says ${TARGET_MAJOR}, confirm loaded runtime; Windows: check RuntimeInformation.FrameworkDescription, not the stack setting"
-    # Only consulted once the value is not a current .NET one. A Windows site
-    # running another stack still reports a netFrameworkVersion, so the sibling
-    # field is the evidence and netFrameworkVersion is just the default.
-    elif [ -n "$winStack" ]; then
-      flag="NOTDOTNET"
-      append_action "Windows site running ${winStack}; netFrameworkVersion (${runtime:-unset}) is the platform default here, not evidence of .NET"
     else
       case "$runtime" in
         # .NET Framework rather than an older .NET, worth saying because the
-        # move to the target is a port and not a version bump. v4.0 is equally
-        # what a Windows site running no .NET at all reports, though, static
-        # content and SPAs included, so it cannot be stated as fact.
+        # move to the target is a port and not a version bump. Whether that is
+        # certain depends on CURRENT_STACK: 'dotnet' is the portal saying so,
+        # and without it v4.0 is equally what a Windows site running no .NET at
+        # all reports, static content and SPAs included.
         v1.*|v2.*|v3.*|v4.*)
           flag="ACTION"
-          append_action ".NET Framework ${runtime} - a port to .NET ${TARGET_VERSION}, not an upgrade; on Windows this value is also the default for a site that runs no .NET, so confirm there is a .NET app here first" ;;
+          if [ "$currentStack" = "dotnet" ]; then
+            append_action ".NET Framework ${runtime} (CURRENT_STACK dotnet) - a port to .NET ${TARGET_VERSION}, not an upgrade"
+          else
+            append_action ".NET Framework ${runtime} - a port to .NET ${TARGET_VERSION}, not an upgrade; no CURRENT_STACK set here and this value is also the default for a Windows site that runs no .NET, so confirm there is a .NET app first"
+          fi ;;
         ?*)
           flag="ACTION"
           append_action "stack below ${TARGET_VERSION}" ;;
