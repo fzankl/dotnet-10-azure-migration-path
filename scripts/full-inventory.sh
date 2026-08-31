@@ -90,15 +90,18 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-ARM_ENDPOINT="$(az cloud show --query endpoints.resourceManager -o tsv | sed 's:/*$::')"
+ARM_ENDPOINT="$(az cloud show --query endpoints.resourceManager -o tsv | tr -d '\r' | sed 's:/*$::')"
 
-echo "Signed in as $(az account show --query user.name -o tsv)" >&2
+echo "Signed in as $(az account show --query user.name -o tsv | tr -d '\r')" >&2
 
 # The CLI forwards only the first 1000 subscription IDs to Resource Graph.
 # Past that the query silently covers a subset, so warn rather than report a
 # confidently incomplete estate.
 if [ -z "$SUBSCRIPTION" ]; then
-  SUB_COUNT=$(az account list --query "length([?state=='Enabled'])" -o tsv)
+  SUB_COUNT=$(az account list --query "length([?state=='Enabled'])" -o tsv | tr -d '\r')
+  case "$SUB_COUNT" in
+    ''|*[!0-9]*) echo "Unable to determine subscription count: $SUB_COUNT" >&2; exit 1 ;;
+  esac
   echo "$SUB_COUNT subscription(s) in scope" >&2
   if [ "$SUB_COUNT" -gt 1000 ]; then
     echo "WARNING: only the first 1000 subscriptions are forwarded to Resource Graph." >&2
@@ -521,7 +524,7 @@ n=0
 while IFS= read -r line; do
   [ -z "$line" ] && continue
   n=$((n + 1))
-  "$WORK/probe.sh" "$line" "$ARM_ENDPOINT" "$API_VERSION" > "$WORK/rows/$(printf '%06d' "$n").json" &
+  "$WORK/probe.sh" "$line" "$ARM_ENDPOINT" "$API_VERSION" < /dev/null > "$WORK/rows/$(printf '%06d' "$n").json" &
   if [ $((n % PARALLEL)) -eq 0 ]; then
     wait
     printf '  probed %d/%d\r' "$n" "$TOTAL" >&2
