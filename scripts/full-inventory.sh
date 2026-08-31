@@ -90,20 +90,33 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-ARM_ENDPOINT="$(az cloud show --query endpoints.resourceManager -o tsv | sed 's:/*$::')"
+# tr -d '\r' on every -o tsv value that is used as a string rather than parsed
+# as JSON. The Azure CLI is a Python program, so on Windows its stdout goes
+# through text-mode translation and every line ends CRLF. MSYS bash happens to
+# strip the trailing CR in command substitution, WSL bash calling a Windows az.exe 
+# does not. And a stray CR here silently corrupts every ARM URL built from it.
+ARM_ENDPOINT="$(az cloud show --query endpoints.resourceManager -o tsv | tr -d '\r' | sed 's:/*$::')"
 
-echo "Signed in as $(az account show --query user.name -o tsv)" >&2
+echo "Signed in as $(az account show --query user.name -o tsv | tr -d '\r')" >&2
 
 # The CLI forwards only the first 1000 subscription IDs to Resource Graph.
 # Past that the query silently covers a subset, so warn rather than report a
 # confidently incomplete estate.
 if [ -z "$SUBSCRIPTION" ]; then
-  SUB_COUNT=$(az account list --query "length([?state=='Enabled'])" -o tsv)
-  echo "$SUB_COUNT subscription(s) in scope" >&2
-  if [ "$SUB_COUNT" -gt 1000 ]; then
-    echo "WARNING: only the first 1000 subscriptions are forwarded to Resource Graph." >&2
-    echo "         Run in batches with -s and merge the CSVs." >&2
-  fi
+  SUB_COUNT=$(az account list --query "length([?state=='Enabled'])" -o tsv | tr -d '\r')
+  case "$SUB_COUNT" in
+    ''|*[!0-9]*)
+      echo "Could not determine subscription count (got: '${SUB_COUNT}'); continuing." >&2
+      echo "         If you have more than 1000, only the first 1000 reach Resource Graph." >&2
+      ;;
+    *)
+      echo "$SUB_COUNT subscription(s) in scope" >&2
+      if [ "$SUB_COUNT" -gt 1000 ]; then
+        echo "WARNING: only the first 1000 subscriptions are forwarded to Resource Graph." >&2
+        echo "         Run in batches with -s and merge the CSVs." >&2
+      fi
+      ;;
+  esac
 fi
 
 # ---------------------------------------------------------------------------
@@ -518,10 +531,17 @@ echo "Pass 2: probing $TOTAL resources via ARM (parallelism $PARALLEL)..." >&2
 
 mkdir -p "$WORK/rows"
 n=0
+# < /dev/null is load-bearing. This loop's stdin is graph.jsonl, and every
+# backgrounded probe inherits that same descriptor and file offset. Anything a
+# child reads from stdin -- an az call that goes interactive on a token refresh,
+# say -- advances the offset the parent's read is using, so the loop skips
+# ahead or hits EOF and stops at a nondeterministic count, with no error and a
+# zero exit. Detaching stdin also makes such a call fail fast instead of
+# blocking. probe.sh's own az children inherit /dev/null through it.
 while IFS= read -r line; do
   [ -z "$line" ] && continue
   n=$((n + 1))
-  "$WORK/probe.sh" "$line" "$ARM_ENDPOINT" "$API_VERSION" > "$WORK/rows/$(printf '%06d' "$n").json" &
+  "$WORK/probe.sh" "$line" "$ARM_ENDPOINT" "$API_VERSION" < /dev/null > "$WORK/rows/$(printf '%06d' "$n").json" &
   if [ $((n % PARALLEL)) -eq 0 ]; then
     wait
     printf '  probed %d/%d\r' "$n" "$TOTAL" >&2
