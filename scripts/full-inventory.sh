@@ -27,6 +27,10 @@
 #           Included in Contributor and in Website Contributor.
 #
 # Requires: az cli, jq.
+#
+# Written with AI assistance, then reviewed and run against a live tenant
+# before publishing. Read it before you run it. Both passes are read-only:
+# nothing is written, no application setting is changed.
 
 # This script needs bash 4+: associative arrays, mapfile, process
 # substitution. Re-exec if launched as `sh script.sh` under dash/ash.

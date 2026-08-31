@@ -35,6 +35,8 @@ az graph query -q "resources | summarize count() by type"
 
 Pass 1 needs Reader. Pass 2 additionally needs `Microsoft.Web/sites/config/list/action`, because listing application settings is a POST in ARM, not a read.
 
+Both passes are read-only. Nothing is written, no app setting is changed.
+
 ## Everything else
 
 The `src/` and `infrastructure/` directories are configuration examples for the article, not a deployable solution.  
@@ -47,3 +49,7 @@ git diff --no-index src/OrderApi/Dockerfile.net8.before src/OrderApi/Dockerfile
 ```
 
 If you do want to apply them: `resource_group_name`, `name_prefix` and `location` are required everywhere and have no defaults; `infrastructure/containerapp` additionally requires `container_image`. `src/OrderFunctions/local.settings.json.example` has to be copied to `local.settings.json` and filled in before running the function app locally.
+
+## A note on how this was written
+
+The code in this repository was written with AI assistance. The inventory script was reviewed and run against a live tenant before publishing; the Terraform and application samples are read-and-diff material for the article, not a deployable solution.
